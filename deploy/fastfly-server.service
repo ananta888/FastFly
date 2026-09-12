@@ -1,0 +1,19 @@
+[Unit]
+Description=FastFly connectome simulator web server
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+WorkingDirectory=/home/krusty/fastfly/FastFly
+# Cross-manager After= (system unit from a user unit) is a best-effort hint at
+# most, so the real fix is this: block until the GPU actually hands out a
+# working CUDA context, not just until nvidia-persistenced's process exists.
+# See wait-for-gpu.sh for why (32 crash-looped restarts on 2026-09-12).
+ExecStartPre=/home/krusty/fastfly/FastFly/wait-for-gpu.sh
+ExecStart=/home/krusty/fastfly/.venv/bin/python app_server.py --data flywire_v783.bin --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
