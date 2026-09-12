@@ -217,6 +217,142 @@ __global__ void kernel_count_spikes(
     }
 }
 
+// ---- STDP (spike-timing-dependent plasticity), opt-in, off by default ----
+//
+// Pair-based STDP with exponential eligibility traces. Weights stay INT8
+// (same bandwidth as the base sim); a per-synapse FP32 accumulator soaks up
+// the fractional part of every update so learning stays visible even when a
+// single coincidence is far smaller than one quantization step. Dale's law
+// is enforced: a synapse's sign (from d_weights_orig) never flips —
+// potentiation/depression only move |w| between 0 and the INT8 ceiling.
+
+// Decay both traces every substep; bump a neuron's own trace by 1 if it just
+// spiked (spike_bits already computed by kernel_update_with_noise).
+__global__ void kernel_decay_traces(
+    float*              __restrict__ pre_trace,
+    float*              __restrict__ post_trace,
+    const unsigned int* __restrict__ spike_bits,
+    const int                        N,
+    const float                      decay_pre,
+    const float                      decay_post
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    bool spiked = (spike_bits[i >> 5] >> (i & 31)) & 1u;
+    float pt = pre_trace[i] * decay_pre;
+    float qt = post_trace[i] * decay_post;
+    if (spiked) { pt += 1.0f; qt += 1.0f; }
+    pre_trace[i] = pt;
+    post_trace[i] = qt;
+}
+
+// Spike propagation + LTD, fused (same per-synapse loop as propagate_v2, so
+// no extra kernel launch / extra memory traffic over the pure-physics path).
+// When source neuron i fires: push current as before, AND depress w[i,j] by
+// A_minus * post_trace[j] (j fired recently *before* i -> acausal -> weaken).
+__global__ void kernel_propagate_stdp(
+    const unsigned int* __restrict__ spike_idx,
+    const unsigned int* __restrict__ p_num_spikes,
+    const unsigned int* __restrict__ offsets,
+    const unsigned int* __restrict__ targets,
+    signed char*        __restrict__ weights,
+    const signed char*  __restrict__ weights_orig,
+    float*              __restrict__ weight_accum,
+    const float*        __restrict__ weight_scales,
+    const float*        __restrict__ post_trace,
+    float*              __restrict__ current,
+    const float                      a_minus
+) {
+    unsigned int num_spikes = *p_num_spikes;
+    if (num_spikes == 0) return;
+
+    unsigned int warp_id  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    unsigned int num_warps = (gridDim.x * blockDim.x) >> 5;
+    unsigned int lane = threadIdx.x & 31;
+
+    for (unsigned int s = warp_id; s < num_spikes; s += num_warps) {
+        unsigned int neuron    = spike_idx[s];
+        unsigned int syn_start = offsets[neuron];
+        unsigned int syn_end   = offsets[neuron + 1];
+        float scale = weight_scales[neuron];
+
+        for (unsigned int syn = syn_start + lane; syn < syn_end; syn += 32) {
+            unsigned int t = targets[syn];
+            float w = (float)weights[syn] * scale;
+            atomicAdd(&current[t], w);
+
+            // LTD: move |w| toward 0 by a_minus * post_trace[t] (in raw
+            // int8 units), accumulating the fractional remainder.
+            int orig = (int)weights_orig[syn];
+            if (orig != 0 && scale > 0.0f) {
+                int sign = (orig > 0) ? 1 : -1;
+                float mag_delta = -a_minus * post_trace[t];      // <= 0
+                float acc = weight_accum[syn] + sign * mag_delta / scale;
+                int step = (int)truncf(acc);
+                if (step != 0) {
+                    acc -= (float)step;
+                    int neww = (int)weights[syn] + step;
+                    neww = (sign > 0) ? max(0, min(127, neww))
+                                      : max(-127, min(0, neww));
+                    weights[syn] = (signed char)neww;
+                }
+                weight_accum[syn] = acc;
+            }
+        }
+    }
+}
+
+// LTP: when target neuron j fires, potentiate every incoming synapse i->j by
+// A_plus * pre_trace[i] (i fired recently *before* j -> causal -> strengthen).
+// Needs the transposed (incoming) edge list built once at load time, since
+// the base connectivity is source-major (push model).
+__global__ void kernel_stdp_ltp(
+    const unsigned int* __restrict__ spike_idx,
+    const unsigned int* __restrict__ p_num_spikes,
+    const unsigned int* __restrict__ in_offsets,
+    const unsigned int* __restrict__ in_syn_id,
+    const unsigned int* __restrict__ in_source,
+    signed char*        __restrict__ weights,
+    const signed char*  __restrict__ weights_orig,
+    float*              __restrict__ weight_accum,
+    const float*        __restrict__ weight_scales,
+    const float*        __restrict__ pre_trace,
+    const float                      a_plus
+) {
+    unsigned int num_spikes = *p_num_spikes;
+    if (num_spikes == 0) return;
+
+    unsigned int warp_id  = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    unsigned int num_warps = (gridDim.x * blockDim.x) >> 5;
+    unsigned int lane = threadIdx.x & 31;
+
+    for (unsigned int s = warp_id; s < num_spikes; s += num_warps) {
+        unsigned int post     = spike_idx[s];
+        unsigned int syn_start = in_offsets[post];
+        unsigned int syn_end   = in_offsets[post + 1];
+
+        for (unsigned int k = syn_start + lane; k < syn_end; k += 32) {
+            unsigned int syn = in_syn_id[k];
+            unsigned int src = in_source[k];
+            int orig = (int)weights_orig[syn];
+            float scale = weight_scales[src];
+            if (orig == 0 || scale <= 0.0f) continue;
+            int sign = (orig > 0) ? 1 : -1;
+            float mag_delta = a_plus * pre_trace[src];           // >= 0
+            float acc = weight_accum[syn] + sign * mag_delta / scale;
+            int step = (int)truncf(acc);
+            if (step != 0) {
+                acc -= (float)step;
+                int neww = (int)weights[syn] + step;
+                neww = (sign > 0) ? max(0, min(127, neww))
+                                  : max(-127, min(0, neww));
+                weights[syn] = (signed char)neww;
+            }
+            weight_accum[syn] = acc;
+        }
+    }
+}
+
 }  // extern "C"
 """
 
@@ -232,7 +368,33 @@ def compile_kernels():
         "propagate":   module.get_function("kernel_propagate_spikes"),
         "propagate_v2": module.get_function("kernel_propagate_v2"),
         "count_spikes": module.get_function("kernel_count_spikes"),
+        "decay_traces": module.get_function("kernel_decay_traces"),
+        "propagate_stdp": module.get_function("kernel_propagate_stdp"),
+        "stdp_ltp": module.get_function("kernel_stdp_ltp"),
     }
+
+
+def build_transpose_csr(offsets, targets, n_neurons):
+    """Build the incoming-edge CSR (target-major) needed for LTP, from the
+    base source-major CSR. One-time cost at plasticity-enable time.
+
+    Returns (in_offsets[n_neurons+1], in_syn_id[n_synapses], in_source[n_synapses]):
+    for each target neuron, the original synapse indices feeding it and the
+    source neuron of each.
+    """
+    n_synapses = len(targets)
+    degrees = np.diff(offsets)
+    sources = np.repeat(np.arange(n_neurons, dtype=np.uint32), degrees.astype(np.intp))
+
+    order = np.argsort(targets, kind="stable")
+    in_syn_id = order.astype(np.uint32)
+    in_source = sources[order]
+
+    in_degrees = np.bincount(targets, minlength=n_neurons)
+    in_offsets = np.zeros(n_neurons + 1, dtype=np.uint32)
+    np.cumsum(in_degrees, out=in_offsets[1:])
+
+    return in_offsets, in_syn_id, in_source
 
 # ================================================================
 # Load connectome from binary file

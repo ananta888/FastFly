@@ -22,7 +22,8 @@ except ImportError:
     sys.exit(1)
 
 from flywire_sim import (CUDA_KERNELS, compile_kernels, load_connectome_binary,
-                         generate_synthetic, quantize_weights_int8)
+                         generate_synthetic, quantize_weights_int8,
+                         build_transpose_csr)
 
 ANNOTATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "neuron_annotations.npz")
@@ -49,6 +50,33 @@ class SimEngine:
         w_int8, w_scales = quantize_weights_int8(weights, offsets, self.n_neurons)
         self.d_weights = cp.asarray(w_int8)
         self.d_weight_scales = cp.asarray(w_scales)
+        # Kept forever (read-only): synapse *sign* for Dale's-law-respecting
+        # plasticity clamping, and the "reset learning" baseline.
+        self.d_weights_orig = cp.asarray(w_int8)
+
+        # Plasticity (STDP) — opt-in, off by default; see flywire_sim.py.
+        self.plasticity_enabled = False
+        self.stdp_a_plus = np.float32(0.02)
+        self.stdp_a_minus = np.float32(0.022)  # slightly > a_plus: mild net decay, more stable
+        self.stdp_tau_pre = np.float32(0.9)
+        self.stdp_tau_post = np.float32(0.9)
+        # The LTP pass walks the transposed (target-major) edge list, whose
+        # per-thread source-neuron indices have no spatial locality -> mostly
+        # uncoalesced GPU memory access, ~15x slower than the base sim on its
+        # own. Applying it every Nth substep instead of every one recovers
+        # most of that (learning is far slower than membrane dynamics
+        # anyway); a_plus/a_minus are scaled up by the interval so the
+        # steady-state learning *rate* stays comparable either way.
+        self.stdp_interval = 4
+        self.d_pre_trace = cp.zeros(self.n_neurons, dtype=cp.float32)
+        self.d_post_trace = cp.zeros(self.n_neurons, dtype=cp.float32)
+        self.d_weight_accum = cp.zeros(self.n_synapses, dtype=cp.float32)
+        self._in_offsets = None  # built lazily on first enable_plasticity(True)
+        self._d_in_offsets = None
+        self._d_in_syn_id = None
+        self._d_in_source = None
+        self._offsets_np = offsets
+        self._targets_np = targets
 
         # GPU arrays — neuron state
         rng = cp.random.default_rng(seed)
@@ -209,6 +237,37 @@ class SimEngine:
     def set_noise_amp(self, value):
         self.noise_amp = np.float32(value)
 
+    def enable_plasticity(self, enabled):
+        """Turn STDP on/off. Building the transposed (incoming) edge list —
+        needed for LTP — is a one-time ~1s cost on first enable, not repeated.
+        """
+        enabled = bool(enabled)
+        if enabled and self._d_in_offsets is None:
+            in_offsets, in_syn_id, in_source = build_transpose_csr(
+                self._offsets_np, self._targets_np, self.n_neurons
+            )
+            self._d_in_offsets = cp.asarray(in_offsets)
+            self._d_in_syn_id = cp.asarray(in_syn_id)
+            self._d_in_source = cp.asarray(in_source)
+        self.plasticity_enabled = enabled
+
+    def reset_weights(self):
+        """Restore every synapse to its original, real FlyWire weight —
+        discards everything learned this session."""
+        self.d_weights[...] = self.d_weights_orig
+        self.d_weight_accum.fill(0)
+        self.d_pre_trace.fill(0)
+        self.d_post_trace.fill(0)
+
+    def get_weight_drift(self):
+        """Mean |current - original| synapse magnitude, in raw INT8 units —
+        a single number that rises the longer plasticity has been reshaping
+        the connectome. 0 right after a reset or if plasticity never ran."""
+        diff = cp.abs(
+            self.d_weights.astype(cp.int16) - self.d_weights_orig.astype(cp.int16)
+        )
+        return float(diff.mean())
+
     def step(self, n=50):
         """Run n timesteps and return a metrics dict.
 
@@ -253,6 +312,24 @@ class SimEngine:
         stim_indices = self._stimulus_indices
         stim_amp = self._stimulus_amplitude
 
+        plasticity = self.plasticity_enabled
+        if plasticity:
+            k_decay_traces = self.kernels["decay_traces"]
+            k_propagate_stdp = self.kernels["propagate_stdp"]
+            k_stdp_ltp = self.kernels["stdp_ltp"]
+            d_pre_trace = self.d_pre_trace
+            d_post_trace = self.d_post_trace
+            d_weights_orig = self.d_weights_orig
+            d_weight_accum = self.d_weight_accum
+            d_in_offsets = self._d_in_offsets
+            d_in_syn_id = self._d_in_syn_id
+            d_in_source = self._d_in_source
+            interval = max(1, self.stdp_interval)
+            a_plus = np.float32(self.stdp_a_plus * interval)
+            a_minus = np.float32(self.stdp_a_minus * interval)
+            tau_pre = self.stdp_tau_pre
+            tau_post = self.stdp_tau_post
+
         for sub in range(n):
             d_num_spikes.fill(0)
 
@@ -279,11 +356,41 @@ class SimEngine:
                  neuron_to_motor, d_motor_counts, d_total_spikes,
                  spike_words_i32, n_neurons_i32))
 
-            # Propagate v2 — reads d_num_spikes from device memory, no CPU sync
-            k_propagate_v2(
-                (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
-                (d_spike_idx, d_num_spikes,
-                 d_offsets, d_targets, d_weights, d_weight_scales, d_current))
+            if plasticity:
+                # Traces decay/increment every substep (cheap, O(neurons)) so
+                # timing resolution stays fine-grained even though the much
+                # more expensive weight-update passes below only run every
+                # stdp_interval-th substep.
+                k_decay_traces(
+                    (neuron_blocks,), (BLOCK,),
+                    (d_pre_trace, d_post_trace, d_spike_bits,
+                     n_neurons_i32, tau_pre, tau_post))
+
+                if sub % interval == 0:
+                    # Propagate + LTD fused (source-major, same loop as v2).
+                    k_propagate_stdp(
+                        (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
+                        (d_spike_idx, d_num_spikes, d_offsets, d_targets,
+                         d_weights, d_weights_orig, d_weight_accum,
+                         d_weight_scales, d_post_trace, d_current, a_minus))
+                    # LTP (target-major, via the transposed edge list — the
+                    # expensive, poorly-coalesced pass this interval exists for).
+                    k_stdp_ltp(
+                        (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
+                        (d_spike_idx, d_num_spikes, d_in_offsets, d_in_syn_id,
+                         d_in_source, d_weights, d_weights_orig, d_weight_accum,
+                         d_weight_scales, d_pre_trace, a_plus))
+                else:
+                    k_propagate_v2(
+                        (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
+                        (d_spike_idx, d_num_spikes,
+                         d_offsets, d_targets, d_weights, d_weight_scales, d_current))
+            else:
+                # Propagate v2 — reads d_num_spikes from device memory, no CPU sync
+                k_propagate_v2(
+                    (MAX_PROP_BLOCKS,), (PROP_BLOCK,),
+                    (d_spike_idx, d_num_spikes,
+                     d_offsets, d_targets, d_weights, d_weight_scales, d_current))
 
             self.current_step += 1
 
@@ -301,7 +408,15 @@ class SimEngine:
             "firing_rate": round(firing_rate, 6),
             "mean_voltage": round(float(d_voltage.mean()), 4),
             "steps_per_sec": round(steps_per_sec, 1),
+            "plasticity_enabled": self.plasticity_enabled,
         }
+
+        # Weight drift (how far learning has moved synapses from the real
+        # FlyWire baseline) — an extra GPU reduction + sync, so only sample
+        # it occasionally, and only while plasticity is actually running.
+        self._batch_counter_drift = getattr(self, "_batch_counter_drift", 0) + 1
+        if self.plasticity_enabled and self._batch_counter_drift % 5 == 0:
+            result["weight_drift"] = round(self.get_weight_drift(), 4)
 
         # Group rates (for heatmap) — only compute if enabled
         if self.send_group_rates:

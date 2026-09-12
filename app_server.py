@@ -107,6 +107,7 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.send_text(json.dumps({
         "type": "state",
         "running": sim_running,
+        "plasticity_enabled": engine.plasticity_enabled,
     }))
 
     try:
@@ -159,6 +160,17 @@ async def websocket_endpoint(ws: WebSocket):
                     engine.send_group_rates = bool(value)
                 elif key == "send_motor_rates":
                     engine.send_motor_rates = bool(value)
+                elif key == "plasticity_enabled":
+                    engine.enable_plasticity(bool(value))
+                    await broadcast({
+                        "type": "state",
+                        "running": sim_running,
+                        "plasticity_enabled": engine.plasticity_enabled,
+                    })
+
+            elif cmd == "reset_learning":
+                engine.reset_weights()
+                await broadcast({"type": "state", "running": sim_running, "weight_drift": 0})
 
             elif cmd == "motor_detail":
                 group_name = msg.get("group", "")
